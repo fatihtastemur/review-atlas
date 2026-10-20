@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""ReviewAtlas command-line entry point."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+SKILL_NAME = "review-atlas"
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+LONG_LIVED_BRANCHES = {"main", "master", "test", "stage", "dev", "develop"}
+
+
+def command_value(command: list[str], cwd: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
+def git_value(arguments: list[str], cwd: Path) -> str | None:
+    return command_value(["git", *arguments], cwd)
+
+
+def github_pull_request_base(cwd: Path) -> str | None:
+    gh = shutil.which("gh")
+    if not gh:
+        return None
+    return command_value(
+        [gh, "pr", "view", "--json", "baseRefName", "--jq", ".baseRefName"],
+        cwd,
+    )
+
+
+def select_base_candidate(
+    current_branch: str, ahead_by_ref: list[tuple[str, int]]
+) -> str | None:
+    candidates = [
+        (ref, ahead)
+        for ref, ahead in ahead_by_ref
+        if ref != current_branch and ahead > 0
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[1])[0]
+
+
+def is_long_lived_branch(branch: str) -> bool:
+    return branch.rsplit("/", 1)[-1].lower() in LONG_LIVED_BRANCHES
+
+
+def detect_branch_scope(cwd: Path) -> tuple[str, str] | None:
+    current_branch = git_value(["branch", "--show-current"], cwd)
+    if not current_branch:
+        return None
+
+    pull_request_base = github_pull_request_base(cwd)
+    if pull_request_base:
+        remote_ref = f"origin/{pull_request_base}"
+        if git_value(["rev-parse", "--verify", f"{remote_ref}^{{commit}}"], cwd):
+            return current_branch, remote_ref
+        return current_branch, pull_request_base
+
+    configured_base = git_value(
+        ["config", "--get", "review-atlas.baseBranch"], cwd
+    )
+    if configured_base and git_value(
+        ["rev-parse", "--verify", f"{configured_base}^{{commit}}"], cwd
+    ):
+        return current_branch, configured_base
+
+    remote_default = git_value(
+        ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], cwd
+    )
+    refs = [
+        "origin/develop",
+        "develop",
+        remote_default,
+        "origin/main",
+        "main",
+        "origin/master",
+        "master",
+    ]
+    ahead_by_ref: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        count = git_value(
+            ["rev-list", "--right-only", "--count", f"{ref}...HEAD"], cwd
+        )
+        if count and count.isdigit():
+            ahead_by_ref.append((ref, int(count)))
+
+    base = select_base_candidate(current_branch, ahead_by_ref)
+    return (current_branch, base) if base else None
+
+
+def build_review_prompt(
+    args: argparse.Namespace, cwd: Path | None = None
+) -> str:
+    if args.staged:
+        scope = "the staged Git changes"
+    elif args.branch:
+        scope = (
+            f"branch {args.branch} after determining its most likely base; "
+            "review only changes introduced by that branch"
+        )
+    elif args.base:
+        scope = (
+            f"all changes on the current branch compared with {args.base}, "
+            "including staged, unstaged, and untracked changes"
+        )
+    elif args.commit:
+        scope = f"commit {args.commit}"
+    elif args.pr:
+        scope = f"pull request #{args.pr}"
+    elif args.paths:
+        scope = "these paths: " + ", ".join(args.paths)
+    else:
+        working_directory = cwd or Path.cwd()
+        current_branch = git_value(["branch", "--show-current"], working_directory)
+        if current_branch and is_long_lived_branch(current_branch):
+            return (
+                f"/{SKILL_NAME} The current branch is {current_branch}, which is a "
+                "long-lived branch. Do not start a review yet. Show the available "
+                "target options and ask which branch or target should be reviewed."
+            )
+
+        detected = detect_branch_scope(working_directory)
+        if detected:
+            current_branch, base = detected
+            scope = (
+                f"all changes on branch {current_branch} compared with {base}, "
+                "including staged, unstaged, and untracked changes"
+            )
+        else:
+            scope = (
+                "the current branch after automatically determining its most likely "
+                "base, including committed, staged, unstaged, and untracked changes; "
+                "ask only if the base is genuinely ambiguous"
+            )
+
+    prompt = (
+        f"/{SKILL_NAME} Review {scope}. "
+        "Report only concrete, actionable findings and do not modify files."
+    )
+    if args.focus:
+        prompt += f" Focus on {args.focus}."
+    return prompt
+
+
+def skill_destination(scope: str, project: Path) -> Path:
+    if scope == "project":
+        return project.resolve() / ".claude" / "skills" / SKILL_NAME
+    return Path.home() / ".claude" / "skills" / SKILL_NAME
+
+
+def find_claude_desktop() -> Path | None:
+    candidates = [
+        Path("/Applications/Claude.app"),
+        Path.home() / "Applications" / "Claude.app",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def validate_install_destination(source: Path, destination: Path) -> None:
+    source = source.resolve()
+    destination = destination.resolve(strict=False)
+    if destination == source or source in destination.parents:
+        raise RuntimeError(
+            "Refusing to install the skill inside its own source directory; "
+            "choose another project or use --scope user"
+        )
+
+
+def install_link(source: Path, destination: Path) -> str:
+    if destination.is_symlink():
+        if destination.resolve() == source.resolve():
+            return f"Already installed: {destination}"
+        raise RuntimeError(f"Refusing to replace existing symlink: {destination}")
+    if destination.exists():
+        raise RuntimeError(f"Refusing to replace existing path: {destination}")
+    validate_install_destination(source, destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.symlink_to(source, target_is_directory=source.is_dir())
+    return f"Installed: {destination} -> {source}"
+
+
+def command_install(args: argparse.Namespace) -> int:
+    destination = skill_destination(args.scope, Path(args.project))
+    try:
+        print(install_link(REPOSITORY_ROOT, destination))
+        if args.command:
+            command_destination = Path.home() / ".local" / "bin" / SKILL_NAME
+            print(install_link(Path(__file__).resolve(), command_destination))
+    except (OSError, RuntimeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    failures = 0
+    skill_path = skill_destination(args.scope, Path(args.project))
+    skill_file = skill_path / "SKILL.md"
+    claude_cli = shutil.which("claude")
+    claude_desktop = find_claude_desktop()
+    claude_runtime = claude_cli or claude_desktop
+    checks = {
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "git": shutil.which("git"),
+        "claude": claude_runtime,
+        "skill": skill_file if skill_file.is_file() else None,
+    }
+    for name, value in checks.items():
+        if value:
+            print(f"ok   {name}: {value}")
+        else:
+            print(f"fail {name}: not found")
+            failures += 1
+    if not os.access(REPOSITORY_ROOT / "SKILL.md", os.R_OK):
+        print("fail repository: SKILL.md is not readable")
+        failures += 1
+    else:
+        print(f"ok   repository: {REPOSITORY_ROOT}")
+    if claude_desktop and not claude_cli:
+        print(
+            "info desktop: use a Local Code session; run /reload-skills, then /skills"
+        )
+    return 1 if failures else 0
+
+
+def command_package(args: argparse.Namespace) -> int:
+    script = REPOSITORY_ROOT / "scripts" / "package_skill.py"
+    command = [
+        sys.executable,
+        str(script),
+        str(REPOSITORY_ROOT),
+        "--output-dir",
+        str(Path(args.output_dir)),
+    ]
+    try:
+        return subprocess.run(command, check=False).returncode
+    except OSError as error:
+        print(f"error: could not package skill: {error}", file=sys.stderr)
+        return 1
+
+
+def command_review(args: argparse.Namespace) -> int:
+    prompt = build_review_prompt(args)
+    if args.dry_run:
+        print(prompt)
+        return 0
+
+    claude = shutil.which("claude")
+    if not claude:
+        print("error: Claude Code executable 'claude' was not found", file=sys.stderr)
+        return 1
+
+    command = [claude]
+    if args.print_mode:
+        command.append("--print")
+    command.append(prompt)
+    try:
+        return subprocess.run(command, check=False).returncode
+    except OSError as error:
+        print(f"error: could not start Claude Code: {error}", file=sys.stderr)
+        return 1
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=SKILL_NAME,
+        description="Install and run the ReviewAtlas code review skill.",
+    )
+    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0-dev")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    install_parser = subparsers.add_parser("install", help="Install the Claude Code skill")
+    install_parser.add_argument("--scope", choices=("user", "project"), default="user")
+    install_parser.add_argument("--project", default=".", help="Target project for project scope")
+    install_parser.add_argument(
+        "--command",
+        action="store_true",
+        help="Also install the optional CLI symlink in ~/.local/bin",
+    )
+    install_parser.set_defaults(handler=command_install)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Check local prerequisites")
+    doctor_parser.add_argument("--scope", choices=("user", "project"), default="user")
+    doctor_parser.add_argument("--project", default=".", help="Target project for project scope")
+    doctor_parser.set_defaults(handler=command_doctor)
+
+    package_parser = subparsers.add_parser(
+        "package", help="Build a Claude account upload package"
+    )
+    package_parser.add_argument(
+        "--output-dir", default="dist", help="Directory for review-atlas.skill"
+    )
+    package_parser.set_defaults(handler=command_package)
+
+    review_parser = subparsers.add_parser("review", help="Start a Claude Code review")
+    target = review_parser.add_mutually_exclusive_group()
+    target.add_argument("--staged", action="store_true", help="Review staged changes")
+    target.add_argument("--branch", help="Review changes introduced by this branch")
+    target.add_argument("--base", help="Review the current branch against this base ref")
+    target.add_argument("--commit", help="Review a specific commit")
+    target.add_argument("--pr", type=int, help="Review a GitHub pull request number")
+    target.add_argument("--paths", nargs="+", help="Review selected paths")
+    review_parser.add_argument("--focus", help="Additional review focus")
+    review_parser.add_argument("--print", dest="print_mode", action="store_true", help="Use Claude Code print mode")
+    review_parser.add_argument("--dry-run", action="store_true", help="Print the generated prompt only")
+    review_parser.set_defaults(handler=command_review)
+
+    return parser
+
+
+def main() -> int:
+    parser = create_parser()
+    args = parser.parse_args()
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
